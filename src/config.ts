@@ -61,6 +61,36 @@ const schema = z.object({
   WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   // Maximum jobs of one kind pulled per cycle.
   WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
+  // Bounded retry policy for worker jobs (see src/services/job-retry.ts).
+  // Settlement submission and anchor polling have separate budgets so one
+  // workload's outages can't be tuned away by the other's settings.
+  // Total submission/poll attempts per job, including the first.
+  WORKER_SETTLEMENT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  // Base delay before the first retry (ms); doubles each attempt up to the cap.
+  WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(1000),
+  WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(30000),
+  // Fraction of the delay applied as random jitter, 0–1.
+  WORKER_SETTLEMENT_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
+  WORKER_ANCHOR_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(5000),
+  WORKER_ANCHOR_RETRY_MAX_DELAY_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(120000),
+  WORKER_ANCHOR_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
   // Per-call network timeouts (ms) — every outbound Horizon/anchor request
   // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
   // a slow or hung upstream can't block a worker cycle indefinitely.

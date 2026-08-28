@@ -59,6 +59,7 @@ const h = vi.hoisted(() => {
     prisma,
     submitPayment: vi.fn(),
     getTransaction: vi.fn(),
+    hashOf: vi.fn(),
     verifyTransactionMemo: vi.fn(),
     getTransactionPayments: vi.fn(),
     verifyPaymentOperation: vi.fn(),

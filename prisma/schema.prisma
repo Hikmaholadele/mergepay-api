@@ -144,6 +144,11 @@ model Settlement {
   submittedAt    DateTime? @map("submitted_at")
   confirmedAt    DateTime? @map("confirmed_at")
   memo           String?
+  /// Client-provided idempotency key for the creation request. Stored on the
+  /// settlement itself so a partial-unique index can enforce that the same
+  /// expense share is never settled twice, even across separate API requests
+  /// that bypass the request-level idempotency service.
+  idempotencyKey String?   @map("idempotency_key")
   expenseId      String?   @map("expense_id")
   expenseShareId String?   @map("expense_share_id")
   createdAt      DateTime  @default(now()) @map("created_at")
@@ -162,6 +167,7 @@ model Settlement {
   @@index([status, nextAttemptAt]) // For picking up eligible worker jobs
   @@index([leaseExpiresAt]) // For recovering leases from crashed workers
   @@index([expiresAt])
+  @@unique([expenseShareId, idempotencyKey], name: "settlement_expense_share_idempotency")
   @@map("settlements")
 }
 

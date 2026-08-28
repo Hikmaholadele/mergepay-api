@@ -183,6 +183,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/deposit", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -263,6 +264,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/withdraw", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -365,6 +367,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     // configuration or accepting any signed envelope. Deposits are additionally
     // owned by their creator; withdrawals require an administrator.
     if (ttx.direction === "deposit") {
+      await requireMembership(ttx.groupId, auth.id);
       if (ttx.userId !== auth.id) {
         throw Errors.forbidden("Only the depositor can confirm this deposit");
       }

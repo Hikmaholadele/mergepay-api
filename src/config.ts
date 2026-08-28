@@ -85,6 +85,17 @@ const schema = z.object({
   // account's sequence number moves on — so this is when Mergepay records the
   // state the chain has effectively already put it in.
   TREASURY_PROPOSAL_EXPIRY_DAYS: z.coerce.number().int().positive().max(365).default(7),
+
+  // Retry budgets for settlement and anchor background jobs.
+  WORKER_SETTLEMENT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(1000),
+  WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(30_000),
+  WORKER_SETTLEMENT_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
+  WORKER_ANCHOR_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(5000),
+  WORKER_ANCHOR_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(120_000),
+  WORKER_ANCHOR_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
+
   // Per-call network timeouts (ms) — every outbound Horizon/anchor request
   // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
   // a slow or hung upstream can't block a worker cycle indefinitely.

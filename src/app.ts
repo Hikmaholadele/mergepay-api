@@ -38,6 +38,7 @@ import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
 import { nanoid } from "nanoid";
+import { AppError, ErrorCode } from "./lib/errors";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -234,11 +235,21 @@ export async function buildApp(): Promise<FastifyInstance> {
     timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: globalRateLimitKey,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
-    errorResponseBuilder: (request: FastifyRequest) => ({
-      code: "RATE_LIMITED",
-      message: "Too many requests. Please retry later.",
-      requestId: request.id,
-    }),
+    errorResponseBuilder: () =>
+      // Must be a real Error (AppError), not a bare payload object:
+      // @fastify/rate-limit *throws* whatever this builder returns, and
+      // Fastify's error pipeline — the central error handler below, which
+      // stamps the requestId and the standard JSON envelope — only engages
+      // for Error instances. A bare object bypassed the handler entirely and
+      // surfaced as a 500 INTERNAL_ERROR with the 429 headers already set,
+      // which is precisely the incoherence this builder exists to avoid.
+      // (The builder's request argument is intentionally unused: the error
+      // handler owns the requestId.)
+      new AppError(
+        429,
+        ErrorCode.RATE_LIMITED,
+        "Too many requests. Please retry later."
+      ),
   });
   // Multipart limits, all explicit. Only /uploads/receipt consumes a multipart
   // body (the SEP-24 anchor flow is JSON end to end), so these bound that one

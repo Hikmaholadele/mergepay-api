@@ -5,7 +5,7 @@ import { audit } from "./audit";
 import { Errors } from "../errors";
 import { applySettlementTransition } from "./settlement-machine";
 import type { CorrelationContext } from "../lib/correlation";
-import { jobContext, loggerWithContext } from "../lib/correlation";
+import { loggerWithContext } from "../lib/correlation";
 import {
   verifyTransactionMemo,
   verifyPaymentOperation,
@@ -18,75 +18,12 @@ const log = pino({ name: "settlement-reconciliation" });
 /** Maximum number of reconciliation retries per settlement. */
 export const RECONCILIATION_MAX_RETRIES = 10;
 
-/** Batch size for each reconciliation cycle. */
-const BATCH_SIZE = 50;
-
-const reconciling = new Set<string>();
-
 /**
- * Run one reconciliation cycle for all settlements in `pending_confirmation`
- * state — i.e. settlements that were successfully submitted to Horizon but
- * whose Stellar outcome has not yet been confirmed.
- *
- * Reconciliation is read-only against Horizon: it calls
- * `stellar.getTransaction(hash)` and never `submitPayment`.
- *
- *   Transaction found & successful        → verify memo + payment details
- *                                           → `completed`  (terminal)
- *   Transaction found & failed             → `failed`     (terminal)
- *   Transaction not yet visible            → stays `pending_confirmation`,
- *                                             retryCount incremented.
- *                                             If retries exhausted → `failed`
- *   Verification failure (mismatch)        → `failed`     (terminal)
+ * The three states one Horizon lookup can leave a settlement in. `pending`
+ * means Horizon has not seen the transaction yet — it is not a failure and
+ * the settlement stays in `pending_confirmation`.
  */
-export async function reconcileSettlements(
-  maxRetries: number = RECONCILIATION_MAX_RETRIES,
-  ctx?: CorrelationContext
-): Promise<void> {
-  const settlements = await prisma.settlement.findMany({
-    where: {
-      status: "pending_confirmation",
-      stellarTxHash: { not: null },
-    },
-    include: {
-      to: { select: { stellarPublicKey: true } },
-    },
-    take: BATCH_SIZE,
-  });
-
-  for (const row of settlements) {
-    if (reconciling.has(row.id)) continue;
-    reconciling.add(row.id);
-
-    const recCtx = ctx ?? jobContext("reconciliation", row.id);
-    const recLog = loggerWithContext(log, recCtx);
-
-    try {
-      await reconcileSingleSettlement(
-        {
-          id: row.id,
-          groupId: row.groupId,
-          stellarTxHash: row.stellarTxHash,
-          retryCount: row.retryCount,
-          shortCode: row.shortCode,
-          amount: String(row.amount),
-          assetCode: row.assetCode,
-          assetIssuer: row.assetIssuer,
-          destinationPublicKey: row.to.stellarPublicKey,
-        },
-        maxRetries,
-        recCtx
-      );
-    } catch (err) {
-      recLog.error(
-        { id: row.id, hash: row.stellarTxHash, err: err instanceof Error ? err.message : String(err) },
-        "unexpected reconciliation error"
-      );
-    } finally {
-      reconciling.delete(row.id);
-    }
-  }
-}
+export type SettlementReconciliationOutcome = "confirmed" | "failed" | "pending";
 
 /**
  * Parameters needed for full settlement verification against Horizon.
@@ -113,29 +50,36 @@ export interface ReconcilableSettlement {
 /**
  * Reconcile a single `pending_confirmation` settlement against Horizon.
  *
- * When the transaction is confirmed successful, the memo and payment
- * operation details are verified against the settlement record before
- * marking it completed. Verification failures are terminal — the
- * settlement is moved to `failed` with a descriptive reason.
+ * Reconciliation is read-only against Horizon: it calls
+ * `stellar.getTransaction(hash)` and never `submitPayment`.
  *
- * Exported for testing. Callers should handle concurrency gating and
- * error logging.
+ *   Transaction found & successful        → verify memo + payment details
+ *                                           → `confirmed`
+ *   Transaction found & failed             → `failed`     (terminal)
+ *   Transaction not yet visible            → stays `pending_confirmation`,
+ *                                             retryCount incremented
+ *                                             → `pending`
+ *                                             If retries exhausted → `failed`
+ *   Verification failure (mismatch)        → `failed`     (terminal)
+ *
+ * Returns the observed outcome so the calling worker can aggregate batch
+ * counts. Concurrency gating (a lease claim before this runs) is the
+ * caller's responsibility — see src/worker/index.ts.
  */
 export async function reconcileSingleSettlement(
   settlement: ReconcilableSettlement,
   maxRetries: number = RECONCILIATION_MAX_RETRIES,
   ctx?: CorrelationContext
-): Promise<void> {
+): Promise<SettlementReconciliationOutcome> {
   const hash = settlement.stellarTxHash;
-  if (!hash) return;
+  if (!hash) return "pending";
 
   const recLog = loggerWithContext(log, ctx);
 
   const tx = await stellar.getTransaction(hash);
 
   if (tx === null) {
-    await handleTransactionNotFound(settlement, hash, maxRetries, recLog);
-    return;
+    return await handleTransactionNotFound(settlement, hash, maxRetries, recLog);
   }
 
   if (tx.successful) {
@@ -187,7 +131,7 @@ export async function reconcileSingleSettlement(
           { id: settlement.id, hash, reason: err.message },
           "settlement transaction verification failed"
         );
-        return;
+        return "failed";
       }
       throw err;
     }
@@ -212,27 +156,29 @@ export async function reconcileSingleSettlement(
     void dispatchEvent("settlement.confirmed", { settlementId: settlement.id, stellarTxHash: hash }, settlement.groupId)
       .catch(() => undefined);
     recLog.info({ id: settlement.id, hash }, "settlement completed");
-  } else {
-    await applySettlementTransition({
-      settlementId: settlement.id,
-      nextStatus: "failed",
-      source: "worker",
-      extraData: {
-        failureReason: `Transaction ${hash} failed on Stellar`,
-        retryCount: settlement.retryCount,
-      },
-    });
-    await audit({
-      userId: null,
-      action: "settlement.failed",
-      entityType: "settlement",
-      entityId: settlement.id,
-      metadata: { stellarTxHash: hash, reason: "transaction_failed" },
-    });
-    void dispatchEvent("settlement.failed", { settlementId: settlement.id, reason: "transaction_failed" }, settlement.groupId)
-      .catch(() => undefined);
-    recLog.error({ id: settlement.id, hash }, "settlement transaction failed on Stellar");
+    return "confirmed";
   }
+
+  await applySettlementTransition({
+    settlementId: settlement.id,
+    nextStatus: "failed",
+    source: "worker",
+    extraData: {
+      failureReason: `Transaction ${hash} failed on Stellar`,
+      retryCount: settlement.retryCount,
+    },
+  });
+  await audit({
+    userId: null,
+    action: "settlement.failed",
+    entityType: "settlement",
+    entityId: settlement.id,
+    metadata: { stellarTxHash: hash, reason: "transaction_failed" },
+  });
+  void dispatchEvent("settlement.failed", { settlementId: settlement.id, reason: "transaction_failed" }, settlement.groupId)
+    .catch(() => undefined);
+  recLog.error({ id: settlement.id, hash }, "settlement transaction failed on Stellar");
+  return "failed";
 }
 
 async function handleTransactionNotFound(
@@ -240,7 +186,7 @@ async function handleTransactionNotFound(
   hash: string,
   maxRetries: number,
   recLog: ReturnType<typeof loggerWithContext>
-): Promise<void> {
+): Promise<SettlementReconciliationOutcome> {
   const nextRetryCount = settlement.retryCount + 1;
 
   if (nextRetryCount > maxRetries) {
@@ -268,14 +214,16 @@ async function handleTransactionNotFound(
       { id: settlement.id, hash, attempts: nextRetryCount, maxRetries },
       "settlement reconciliation exhausted"
     );
-  } else {
-    await prisma.settlement.update({
-      where: { id: settlement.id },
-      data: { retryCount: nextRetryCount },
-    });
-    recLog.debug(
-      { id: settlement.id, hash, attempt: nextRetryCount, maxRetries },
-      "transaction not yet visible on Horizon, will retry"
-    );
+    return "failed";
   }
+
+  await prisma.settlement.update({
+    where: { id: settlement.id },
+    data: { retryCount: nextRetryCount },
+  });
+  recLog.debug(
+    { id: settlement.id, hash, attempt: nextRetryCount, maxRetries },
+    "transaction not yet visible on Horizon, will retry"
+  );
+  return "pending";
 }

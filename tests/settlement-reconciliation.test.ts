@@ -49,7 +49,6 @@ vi.mock("../src/services/horizonService", () => ({
 }));
 
 import {
-  reconcileSettlements,
   reconcileSingleSettlement,
   type ReconcilableSettlement,
 } from "../src/services/settlement-reconciliation";
@@ -113,70 +112,9 @@ beforeEach(() => {
   h.verifyPaymentOperation.mockImplementation(() => {});
 });
 
-describe("reconcileSettlements", () => {
-  it("processes a batch of pending_confirmation settlements", async () => {
-    h.prisma.settlement.findMany.mockResolvedValue([
-      pendingConfirmationSettlement({ id: "s1", stellarTxHash: "hash1" }),
-      pendingConfirmationSettlement({ id: "s2", stellarTxHash: "hash2" }),
-    ]);
-    h.getTransaction.mockResolvedValue({ successful: true });
-
-    await reconcileSettlements(10);
-
-    expect(h.prisma.settlement.updateMany).toHaveBeenCalledTimes(2);
-    expect(h.getTransaction).toHaveBeenCalledTimes(2);
-    expect(h.getTransaction).toHaveBeenCalledWith("hash1");
-    expect(h.getTransaction).toHaveBeenCalledWith("hash2");
-    expect(h.verifyTransactionMemo).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not call getTransaction when there are no pending_confirmation settlements", async () => {
-    h.prisma.settlement.findMany.mockResolvedValue([]);
-
-    await reconcileSettlements();
-
-    expect(h.getTransaction).not.toHaveBeenCalled();
-    expect(h.prisma.settlement.updateMany).not.toHaveBeenCalled();
-  });
-
-  it("handles errors for individual settlements without stopping the batch", async () => {
-    h.prisma.settlement.findMany.mockResolvedValue([
-      pendingConfirmationSettlement({ id: "s1", stellarTxHash: "hash1" }),
-      pendingConfirmationSettlement({ id: "s2", stellarTxHash: "hash2" }),
-    ]);
-    h.getTransaction
-      .mockRejectedValueOnce(new Error("network error"))
-      .mockResolvedValueOnce({ successful: true });
-
-    await reconcileSettlements(10);
-
-    // s2 should still be processed despite s1's error
-    expect(h.getTransaction).toHaveBeenCalledTimes(2);
-    expect(h.prisma.settlement.updateMany).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not call getTransaction for a settlement that has no stellarTxHash", async () => {
-    h.prisma.settlement.findMany.mockResolvedValue([
-      pendingConfirmationSettlement({ id: "s1", stellarTxHash: null }),
-    ]);
-
-    await reconcileSettlements(10);
-
-    expect(h.getTransaction).not.toHaveBeenCalled();
-  });
-
-  it("only queries settlements in pending_confirmation status", async () => {
-    h.prisma.settlement.findMany.mockResolvedValue([]);
-
-    await reconcileSettlements();
-
-    expect(h.prisma.settlement.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { status: "pending_confirmation", stellarTxHash: { not: null } },
-      })
-    );
-  });
-});
+// The batch-level reconciliation loop (formerly reconcileSettlements here)
+// moved into the worker as reconcilePendingSettlements, where it runs under
+// the lease claim — its coverage lives in tests/worker.test.ts.
 
 describe("reconcileSingleSettlement", () => {
   it("moves to completed when transaction is found, successful, and verified", async () => {

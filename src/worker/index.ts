@@ -71,7 +71,11 @@ import {
   SETTLEMENT_RETRY_POLICY,
   type JobFailureCategory,
 } from "../services/job-retry";
-import { reconcileSettlements } from "../services/settlement-reconciliation";
+import {
+  RECONCILIATION_MAX_RETRIES,
+  reconcileSingleSettlement,
+  type SettlementReconciliationOutcome,
+} from "../services/settlement-reconciliation";
 import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
 import { cleanupChallenges } from "./tasks/cleanup-challenges";
@@ -700,7 +704,10 @@ export async function recoverStaleSettlements(): Promise<number> {
   const now = new Date();
   const { count } = await prisma.settlement.updateMany({
     where: {
-      status: { in: [...SUBMITTABLE_STATUSES] },
+      // pending_confirmation is included: its reconciliation runs under the
+      // same lease regime, so a crash mid-check must free the row the same way
+      // a crash mid-submission does.
+      status: { in: [...SUBMITTABLE_STATUSES, "pending_confirmation"] },
       leaseExpiresAt: { lt: now },
     },
     data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
@@ -713,6 +720,143 @@ export async function recoverStaleSettlements(): Promise<number> {
     );
   }
   return count;
+}
+
+// ---------------------------------------------------------------------------
+// pending_confirmation reconciliation
+// ---------------------------------------------------------------------------
+
+/** The settlement statuses the reconciliation job owes a Horizon check. */
+const RECONCILABLE_STATUSES = ["pending_confirmation"] as const;
+
+/**
+ * Take exclusive ownership of a pending-confirmation reconciliation.
+ *
+ * Same conditional-update lease as settlement submission: the row must still
+ * be in `pending_confirmation`, still be on the attempt this worker read, and
+ * must not carry a live lease. Two workers racing on one row produce exactly
+ * one update with `count === 1`.
+ */
+async function claimPendingConfirmation(job: {
+  id: string;
+  retryCount: number;
+}): Promise<boolean> {
+  if (isShuttingDown) return false;
+  const now = new Date();
+
+  const { count } = await prisma.settlement.updateMany({
+    where: {
+      id: job.id,
+      status: { in: [...RECONCILABLE_STATUSES] },
+      retryCount: job.retryCount,
+      AND: [
+        { OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: now } }] },
+      ],
+    },
+    data: {
+      claimedBy: WORKER_ID,
+      claimedAt: now,
+      leaseExpiresAt: leaseDeadline(),
+    },
+  });
+
+  return count === 1;
+}
+
+/**
+ * One cycle of pending_confirmation reconciliation: pick up every settled-in
+ * question row, claim it, ask Horizon which of the three outcomes it reached,
+ * and let the state machine persist it.
+ *
+ * A Horizon lookup that comes back empty is deliberately *not* a resolution:
+ * the transaction was submitted but is not on the ledger yet, so the row keeps
+ * its status, its retry count climbs, and the bounded budget in
+ * reconcileSingleSettlement decides when enough silence is enough.
+ *
+ * Read-only against Horizon — nothing here ever calls submitPayment. Reusing
+ * the claim means a worker that dies mid-check leaves its lease behind, and
+ * the row is picked up again after the lease lapses instead of being checked
+ * by two processes at once.
+ */
+export async function reconcilePendingSettlements(): Promise<void> {
+  const rows = await prisma.settlement.findMany({
+    where: {
+      status: { in: [...RECONCILABLE_STATUSES] },
+      stellarTxHash: { not: null },
+      AND: [
+        { OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: new Date() } }] },
+      ],
+    },
+    include: {
+      to: { select: { stellarPublicKey: true } },
+    },
+    take: config.WORKER_BATCH_SIZE,
+    orderBy: { updatedAt: "asc" as const },
+  });
+
+  if (rows.length === 0) return;
+
+  let checked = 0;
+  const outcomes: Record<SettlementReconciliationOutcome, number> = {
+    confirmed: 0,
+    failed: 0,
+    pending: 0,
+  };
+
+  for (const row of rows) {
+    if (isShuttingDown) break;
+
+    if (!(await claimPendingConfirmation(row))) continue;
+
+    const ctx = jobContext("reconciliation", row.id);
+    checked += 1;
+
+    try {
+      const outcome = await reconcileSingleSettlement(
+        {
+          id: row.id,
+          groupId: row.groupId,
+          stellarTxHash: row.stellarTxHash,
+          retryCount: row.retryCount,
+          shortCode: row.shortCode,
+          amount: String(row.amount),
+          assetCode: row.assetCode,
+          assetIssuer: row.assetIssuer,
+          destinationPublicKey: row.to.stellarPublicKey,
+        },
+        RECONCILIATION_MAX_RETRIES,
+        ctx
+      );
+      outcomes[outcome] += 1;
+    } catch (error) {
+      // One row blowing up must not take the batch — or the worker — down.
+      outcomes.pending += 1;
+      loggerWithContext(log, ctx).error(
+        {
+          jobType: "reconciliation",
+          jobId: row.id,
+          outcome: "error",
+          hash: row.stellarTxHash,
+          reason: safeFailureMessage(error),
+        },
+        "unexpected error reconciling pending settlement"
+      );
+    } finally {
+      await releaseSettlement(row.id);
+    }
+  }
+
+  log.info(
+    {
+      jobType: "reconciliation",
+      outcome: "batch_reconciled",
+      checked,
+      confirmed: outcomes.confirmed,
+      failed: outcomes.failed,
+      stillPending: outcomes.pending,
+    },
+    "reconciled pending_confirmation settlements against Horizon"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,7 +1293,7 @@ export async function runWorkerCycle(): Promise<void> {
   await Promise.allSettled([
     processSubmittedSettlements(),
     reconcileAnchors(),
-    reconcileSettlements(),
+    reconcilePendingSettlements(),
     reconcileAllTreasuryBalances(),
     expireInvites(),
     deliverPendingWebhooks(),

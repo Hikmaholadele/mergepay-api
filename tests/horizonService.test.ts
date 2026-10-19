@@ -41,11 +41,13 @@ vi.mock("@stellar/stellar-sdk", () => {
   };
 });
 
-vi.mock("../src/services/timeout", () => ({
-  withTimeout: vi.fn((_name: string, _ms: number, fn: () => any) => fn()),
-  TimeoutError: class TimeoutError extends Error {},
-  TransportError: class TransportError extends Error {},
-}));
+vi.mock("../src/services/timeout", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/services/timeout")>();
+  return {
+    ...actual,
+    withTimeout: vi.fn((_name: string, _ms: number, fn: () => any) => fn()),
+  };
+});
 
 import {
   verifyTransactionMemo,
@@ -142,12 +144,31 @@ describe("getTransactionFromHorizon", () => {
     );
   });
 
-  it("wraps generic errors in Errors.upstream", async () => {
+  it("categorizes generic provider errors without exposing upstream messages", async () => {
     h.mockTransactionCall.mockRejectedValue(new Error("Horizon request failed: connection timeout"));
 
-    await expect(getTransactionFromHorizon("tx_hash_generic")).rejects.toThrow(
-      "Horizon request failed: connection timeout"
-    );
+    await expect(getTransactionFromHorizon("tx_hash_generic")).rejects.toMatchObject({
+      name: "ProviderError",
+      category: "unavailable",
+      provider: "horizon",
+      operation: "Horizon.getTransactionDetails",
+      message: "Horizon request failed",
+    });
+  });
+
+  it("categorizes rejected transactions and retains safe result codes", async () => {
+    h.mockTransactionCall.mockRejectedValue(Object.assign(new Error("Transaction failed"), {
+      response: {
+        status: 400,
+        data: { extras: { result_codes: { transaction_result_code: "tx_failed" } } },
+      },
+    }));
+
+    await expect(getTransactionFromHorizon("tx_hash_rejected")).rejects.toMatchObject({
+      name: "ProviderError",
+      category: "rejected",
+      detail: ["tx_failed"],
+    });
   });
 });
 
@@ -354,9 +375,11 @@ describe("verifyTransactionMemo — Horizon network error", () => {
       new Error("Horizon request failed: connection timeout")
     );
 
-    await expect(verifyTransactionMemo("tx_hash_7", "MP:ABC234")).rejects.toThrow(
-      "Horizon request failed: connection timeout"
-    );
+    await expect(verifyTransactionMemo("tx_hash_7", "MP:ABC234")).rejects.toMatchObject({
+      name: "ProviderError",
+      category: "unavailable",
+      provider: "horizon",
+    });
   });
 });
 

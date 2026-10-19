@@ -12,7 +12,8 @@ import { Horizon, Memo } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { createLogger } from "../lib/logger";
-import { withTimeout, TimeoutError, TransportError } from "./timeout";
+import { ProviderError } from "../lib/provider-error";
+import { withTimeout, TimeoutError, TransportError, toProviderError } from "./timeout";
 import {
   classifyHorizonError,
   horizonRetryDelayMs,
@@ -103,18 +104,41 @@ async function withQueryRetry<T>(
   );
   if (outcome.ok) return outcome.value;
 
-  // Retries exhausted (or a permanent failure): map onto the module's stable
-  // upstream shape, preserving TimeoutError/TransportError for callers that
-  // classify outcomes themselves (the worker's reconciliation).
-  const last = outcome.lastError;
-  if (last instanceof TimeoutError || last instanceof TransportError) throw last;
-  if (last instanceof Error && last.name === "NotFoundError") throw last;
-  const status = (last as { response?: { status?: number } } | null)?.response?.status;
-  if (status === 404) throw last;
-  if (last instanceof Error) {
-    throw Errors.upstream(`Horizon request failed: ${last.message}`);
-  }
-  throw Errors.upstream("Horizon request failed with unknown error");
+  // Keep the original provider error intact until the endpoint-specific
+  // boundary can distinguish 404s and normalize the remaining failures.
+  throw outcome.lastError;
+}
+
+function normalizeHorizonFailure(error: unknown, operation: string): Error {
+  const normalized = toProviderError(error, {
+    provider: "horizon",
+    operation,
+    fallbackMessage: "Horizon request failed",
+  });
+  const category = normalized instanceof ProviderError
+    ? normalized.category
+    : error instanceof TimeoutError
+      ? "timeout"
+      : error instanceof TransportError
+        ? "transport"
+        : "application";
+
+  log.warn(
+    {
+      provider: "horizon",
+      operation,
+      category,
+      ...(normalized instanceof ProviderError && normalized.detail
+        ? { resultCodes: normalized.detail }
+        : {}),
+    },
+    "Horizon request failed"
+  );
+
+  // Preserve these concrete types for workers that treat their outcomes
+  // differently (a timeout may have an indeterminate ledger result).
+  if (error instanceof TimeoutError || error instanceof TransportError) return error;
+  return normalized;
 }
 
 /**
@@ -174,19 +198,14 @@ export async function getTransactionFromHorizon(
       return server().transactions().transaction(txHash).call();
     });
     return tx as unknown as HorizonTransactionRecord;
-  } catch (e: any) {
-    if (e?.response?.status === 404 || e?.name === "NotFoundError") {
+  } catch (error: unknown) {
+    const status = error && typeof error === "object" && "response" in error
+      ? (error as { response?: { status?: unknown } }).response?.status
+      : undefined;
+    if (status === 404 || (error instanceof Error && error.name === "NotFoundError")) {
       return null;
     }
-    // Re-throw TimeoutError and TransportError as-is so callers can classify them.
-    if (e instanceof TimeoutError || e instanceof TransportError) {
-      throw e;
-    }
-    // Map other Horizon errors to descriptive backend errors.
-    if (e instanceof Error) {
-      throw Errors.upstream(`Horizon request failed: ${e.message}`);
-    }
-    throw Errors.upstream("Horizon request failed with unknown error");
+    throw normalizeHorizonFailure(error, "Horizon.getTransactionDetails");
   }
 }
 
@@ -224,14 +243,8 @@ export async function getTransactionPayments(
       ) as unknown as HorizonPaymentOperation[];
     });
     return result;
-  } catch (e: any) {
-    if (e instanceof TimeoutError || e instanceof TransportError) {
-      throw e;
-    }
-    if (e instanceof Error) {
-      throw Errors.upstream(`Horizon request failed: ${e.message}`);
-    }
-    throw Errors.upstream("Horizon request failed with unknown error");
+  } catch (error: unknown) {
+    throw normalizeHorizonFailure(error, "Horizon.getTransactionPayments");
   }
 }
 

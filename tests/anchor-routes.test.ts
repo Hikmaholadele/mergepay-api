@@ -239,6 +239,11 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
     });
 
     expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      type: "interactive",
+      url: "https://anchor.test/interactive/abc",
+      id: "ext_new",
+    });
     expect(res.json().session.status).toBe("pending_user_transfer_start");
     expect(res.json().session.interactiveUrl).toBe("https://anchor.test/interactive/abc");
     expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith({

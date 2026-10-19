@@ -220,14 +220,26 @@ export default async function anchorRoutes(app: FastifyInstance) {
         description:
           "Exchanges signed SEP-10 challenge for an anchor JWT and returns the SEP-24 interactive URL.",
         params: openApiIdParams(),
-        body: openApiBody(z.object({ signedXdr: z.string().min(1) })),
-        response: openApiEnvelope("session"),
+        body: openApiBody(z.object({ signedXdr: z.string().min(1) }).strict()),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "url", "id", "session"],
+            properties: {
+              type: { type: "string", enum: ["interactive"] },
+              url: { type: "string", format: "uri" },
+              id: { type: "string" },
+              session: { type: "object", additionalProperties: true },
+            },
+          },
+        },
       },
     },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
-      const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+      const body = z.object({ signedXdr: z.string().min(1) }).strict().parse(req.body);
 
       const session = await prisma.anchorSession.findUnique({
         where: { id },
@@ -260,7 +272,12 @@ export default async function anchorRoutes(app: FastifyInstance) {
         },
       });
 
-      return { session: serializeAnchorSession(updated) };
+      return {
+        type: "interactive" as const,
+        url: interactive.url,
+        id: interactive.id,
+        session: serializeAnchorSession(updated),
+      };
     }
   );
 
